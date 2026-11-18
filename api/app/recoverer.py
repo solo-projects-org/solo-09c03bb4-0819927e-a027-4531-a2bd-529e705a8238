@@ -16,12 +16,16 @@ import time
 import psycopg
 from psycopg.rows import dict_row
 
-from . import config, state, source
+from . import config, merger, state, source
 from .walutil import lsn_to_int, wal_file_name
 
 
 class Cancelled(Exception):
     """任务被用户取消。"""
+
+
+class InstanceMismatch(Exception):
+    """查询端口后的实例已不再是该任务恢复出的实例（防止错标时点）。"""
 
 
 # ---------------------------------------------------------------- 调度
@@ -67,6 +71,13 @@ def resume_after_restart() -> None:
                 _pg_ctl(ddir, "start", os.path.join(ddir, "server.log"))
             with _control_conn() as con:
                 con.execute("SELECT 1")
+            if not j.get("as_of_lsn"):
+                # 老版本任务补登时点标注：pause@核对点时重放位点即核对点 LSN
+                cp = state.one_row(
+                    "SELECT restore_lsn FROM checkpoints WHERE name=?",
+                    (j["checkpoint_name"],))
+                if cp:
+                    state.update_job(j["id"], as_of_lsn=cp["restore_lsn"])
             state.update_job(j["id"], detail="API 重启后实例已重新拉起，可继续只读查询")
         except Exception as e:  # noqa: BLE001
             state.update_job(j["id"], status="failed",
@@ -141,8 +152,8 @@ def run_job(job_id: int) -> None:
 
         # 5) 校验确实停在核对点（杜绝半库报成功），随后 promote 并核查只读
         state.update_job(job_id, status="verifying", detail="校验恢复位点并提升")
-        rows = _verify_and_promote(cp, ddir)
-        state.update_job(job_id, status="ready",
+        rows, as_of = _verify_and_promote(cp, ddir)
+        state.update_job(job_id, status="ready", as_of_lsn=as_of,
                          detail=f"恢复完成，目标库只读，samples 现有 {rows} 行",
                          ready_at=state.now(), error=None, log_tail=None)
     except Cancelled:
@@ -225,7 +236,8 @@ def _wait_replay_paused(job_id: int, cp: dict, ddir: str) -> None:
     )
 
 
-def _verify_and_promote(cp: dict, ddir: str) -> int:
+def _verify_and_promote(cp: dict, ddir: str) -> tuple[int, str]:
+    """校验位点、promote、核查只读；返回 (samples 行数, 实例停住的 WAL 位点)。"""
     target = lsn_to_int(cp["restore_lsn"])
     with _control_conn() as con:
         in_rec, _paused, last = con.execute(
@@ -259,7 +271,7 @@ def _verify_and_promote(cp: dict, ddir: str) -> int:
         ro = con.execute("SHOW default_transaction_read_only").fetchone()[0]
         if str(ro).lower() != "on":
             raise RuntimeError("目标库未处于只读模式")
-    return rows
+    return rows, last
 
 
 # ---------------------------------------------------------------- 实例管理
@@ -368,23 +380,31 @@ def _query_conn() -> psycopg.Connection:
     )
 
 
-def fetch_samples(station_no: str | None, sample_no: str | None,
-                  limit: int) -> list[dict]:
-    sql = ("SELECT id, sample_no, station_no, ph::float8 AS ph, created_at"
-           " FROM public.samples")
-    where, params = [], []
-    if station_no:
-        where.append("station_no = %s")
-        params.append(station_no)
-    if sample_no:
-        where.append("sample_no = %s")
-        params.append(sample_no)
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id LIMIT %s"
-    params.append(limit)
+def fetch_samples(job: dict, station_no: str | None, sample_no: str | None,
+                  limit: int) -> dict:
+    """查询该任务恢复出的只读实例（样品 + 该核对点时点的站号映射）。
+
+    - 实例身份核对：恢复目标名烧在实例配置里，若端口后已是另一任务的
+      实例，宁可拒绝也不把新实例的数据错标成旧核对点的时点；
+    - 只用该核对点的样品和映射：样品与映射都来自恢复实例本身；
+    - 旧核对点没有 station_aliases 表时按原站号供数（规范站号 = 原站号）。
+    """
     with _query_conn() as con:
-        return con.execute(sql, params).fetchall()
+        target = con.execute("SHOW recovery_target_name").fetchone()
+        target = target["recovery_target_name"] if target else ""
+        if target != job["checkpoint_name"]:
+            raise InstanceMismatch(
+                f"恢复实例已切换：任务 #{job['id']} 恢复到 "
+                f"{job['checkpoint_name']}，当前端口上的实例恢复到 "
+                f"{target or '?'}；为避免错标时点已拒绝查询，"
+                f"请改用最新 ready 任务"
+            )
+        has_aliases = con.execute(merger.ALIASES_EXIST_SQL).fetchone()["ok"]
+        sql, params = merger.samples_query(has_aliases, station_no, sample_no,
+                                           limit)
+        rows = con.execute(sql, params).fetchall()
+    return {"rows": rows, "mapping_table": has_aliases,
+            "as_of_lsn": job.get("as_of_lsn")}
 
 
 _ALLOWED_HEADS = ("select", "with", "values", "table")

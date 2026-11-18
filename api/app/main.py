@@ -1,16 +1,17 @@
 """水质数仓单实例 PITR 恢复 API。
 
 职责：物理基准备份 + WAL 持续归档之上，登记命名核对点，
-把核对点恢复到独立只读实例并开放样品查询。Swagger 见 /docs。
+把核对点恢复到独立只读实例并开放样品查询；另提供站号归并
+（设备更名后旧站号 → 现行站号映射）。Swagger 见 /docs。
 """
 import os
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
-from . import backuper, config, recoverer, source, state
+from . import backuper, config, merger, recoverer, source, state
 from .walutil import lsn_to_int
 
 _stop = threading.Event()
@@ -23,7 +24,11 @@ DESCRIPTION = """
 * 恢复：基准备份 + 归档 WAL 重放到核对点（pause → 校验位点 → promote），
   产出**独立只读**实例；跨点后才提交的事务不会出现；
 * 查询：只打恢复实例，绝不用当前源库冒充恢复结果；
-* 一次只恢复一项；失败或重启后可按原核对点重试。
+* 一次只恢复一项；失败或重启后可按原核对点重试；
+* 站号归并：登记旧站号 → 现行站号（幂等、拒改指、拒环路、并发不成环），
+  查询样品同时返回原站号与规范站号，样品本身绝不改写；
+* 当前查询单语句读取样品与映射（同一已提交快照）；按恢复任务查询时
+  只用该核对点的样品和映射，旧核对点没有映射表则按原站号供数。
 """
 
 
@@ -41,6 +46,15 @@ class RecoveryIn(BaseModel):
 class QueryIn(BaseModel):
     sql: str = Field(examples=["SELECT * FROM samples ORDER BY id"],
                      description="单条只读 SELECT 语句")
+
+
+class StationMergeIn(BaseModel):
+    old_station_no: str = Field(pattern=merger.STATION_PATTERN,
+                                examples=["ST-02"],
+                                description="被归并的旧站号（登记后不可改指他站）")
+    new_station_no: str = Field(pattern=merger.STATION_PATTERN,
+                                examples=["ST-02A"],
+                                description="归并目标（现行站号或链中下一棒）")
 
 
 # ------------------------------------------------------------------ 生命周期
@@ -79,6 +93,10 @@ async def lifespan(_app: FastAPI):
               os.path.dirname(config.STATE_DB) or "."):
         os.makedirs(d, exist_ok=True)
     state.init_db()
+    try:
+        merger.ensure_table()  # 老部署升级兜底；新部署 01_schema.sql 已建好
+    except Exception:
+        pass  # 源库暂不可达时由登记接口懒建
     recoverer.resume_after_restart()
     threading.Thread(target=_refresher_loop, name="refresher", daemon=True).start()
     threading.Thread(target=recoverer.dispatch_loop, args=(_stop,),
@@ -137,7 +155,7 @@ def _ensure_no_active_job() -> None:
 def root():
     return {"service": "水质数仓 PITR 恢复服务", "docs": "/docs",
             "api": ["/api/health", "/api/basebackup", "/api/checkpoints",
-                    "/api/recoveries"]}
+                    "/api/recoveries", "/api/station-merges", "/api/samples"]}
 
 
 @app.get("/api/health", summary="健康检查")
@@ -206,6 +224,56 @@ def list_checkpoints():
 @app.get("/api/checkpoints/{name}", tags=["checkpoint"], summary="核对点详情")
 def get_checkpoint(name: str):
     return _cp_or_404(name)
+
+
+# ------------------------------------------------------------------ 站号归并
+
+@app.post("/api/station-merges", tags=["merge"], status_code=201,
+          summary="登记站号归并（旧号 → 现行号；幂等；拒改指、拒环路）")
+def create_station_merge(body: StationMergeIn, response: Response):
+    if body.old_station_no == body.new_station_no:
+        raise HTTPException(400, "旧站号与现行站号相同（自环），无需归并")
+    try:
+        result = merger.register_merge(body.old_station_no, body.new_station_no)
+    except merger.MergeConflict as e:
+        raise HTTPException(409, str(e))
+    except merger.MergeCycle as e:
+        raise HTTPException(409, str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"登记站号归并失败: {e}")
+    if not result["created"]:
+        response.status_code = 200  # 幂等：同旧号同目标重复登记
+    return result
+
+
+@app.get("/api/station-merges", tags=["merge"],
+         summary="站号归并映射列表（含连续更名解析到的现行号）")
+def list_station_merges():
+    try:
+        rows = merger.list_merges()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"查询站号归并失败: {e}")
+    return {"row_count": len(rows), "rows": rows}
+
+
+# ------------------------------------------------------------------ 当前查询
+
+@app.get("/api/samples", tags=["samples"],
+         summary="查询当前库样品（原站号 + 规范站号，单语句同一快照）")
+def current_samples(station_no: str | None = Query(
+                        None, description="按站号过滤（命中规范站号或原站号）"),
+                    sample_no: str | None = Query(None, description="按样品号过滤"),
+                    limit: int = Query(100, ge=1, le=1000)):
+    try:
+        rows = merger.current_samples(station_no, sample_no, limit)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"查询当前库失败: {e}")
+    return {
+        "queried_instance": f"source:{config.SOURCE_HOST}:{config.SOURCE_PORT}"
+                            f"（当前生产库，只读查询，不改写样品）",
+        "snapshot": "单条 SQL 读取样品与映射，同一已提交快照",
+        "row_count": len(rows), "rows": rows,
+    }
 
 
 # ------------------------------------------------------------------ 恢复任务
@@ -285,8 +353,9 @@ def _query_meta(job: dict) -> dict:
         "job_id": job["id"],
         "checkpoint": job["checkpoint_name"],
         "restore_lsn": cp["restore_lsn"] if cp else None,
+        "as_of_lsn": job.get("as_of_lsn"),
         "queried_instance": f"recovered-instance:{config.RECOVERY_PORT}"
-                            f"（独立只读库，非生产源库）",
+                            f"（job-{job['id']} 独立只读库，非生产源库）",
         "read_only": True,
     }
 
@@ -294,15 +363,21 @@ def _query_meta(job: dict) -> dict:
 @app.get("/api/recoveries/{job_id}/samples", tags=["query"],
          summary="查询恢复实例中的样品（仅 ready 后开放）")
 def query_samples(job_id: int,
-                  station_no: str | None = Query(None, description="按站号过滤"),
+                  station_no: str | None = Query(
+                      None, description="按站号过滤（命中规范站号或原站号）"),
                   sample_no: str | None = Query(None, description="按样品号过滤"),
                   limit: int = Query(100, ge=1, le=1000)):
     job = _ready_job_or_409(job_id)
     try:
-        rows = recoverer.fetch_samples(station_no, sample_no, limit)
+        result = recoverer.fetch_samples(job, station_no, sample_no, limit)
+    except recoverer.InstanceMismatch as e:
+        raise HTTPException(409, str(e))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"查询恢复实例失败: {e}")
-    return {**_query_meta(job), "row_count": len(rows), "rows": rows}
+    return {**_query_meta(job),
+            "as_of_lsn": result["as_of_lsn"],
+            "mapping_table": result["mapping_table"],
+            "row_count": len(result["rows"]), "rows": result["rows"]}
 
 
 @app.post("/api/recoveries/{job_id}/query", tags=["query"],

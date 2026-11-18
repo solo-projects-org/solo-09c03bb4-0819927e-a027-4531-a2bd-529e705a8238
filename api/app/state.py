@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     data_dir         TEXT,
     log_tail         TEXT,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
+    as_of_lsn        TEXT,              -- 恢复实例停在的 WAL 位点（实例身份核对用）
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL,
     ready_at         TEXT
@@ -72,6 +73,10 @@ def init_db() -> None:
         con = _connect()
         try:
             con.executescript(SCHEMA)
+            # 老状态库迁移：补 as_of_lsn 列
+            cols = {r[1] for r in con.execute("PRAGMA table_info(jobs)")}
+            if "as_of_lsn" not in cols:
+                con.execute("ALTER TABLE jobs ADD COLUMN as_of_lsn TEXT")
             con.commit()
         finally:
             con.close()
